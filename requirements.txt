@@ -1,5 +1,0 @@
-pydub
-PyGObject
-pydbus
-requests
-sounddevice
