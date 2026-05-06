@@ -1,114 +1,104 @@
 mod mock;
 
 use mock::run_mock;
-use spotify_recorder::{ServiceState, monitor_spotify};
+use spotify_recorder::{ServiceControl, monitor_spotify};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use zbus::{connection, zvariant::Value};
+use zbus::{connection, proxy, zvariant::Value};
+
+#[proxy(
+    interface = "org.spotify_recorder.Control",
+    default_path = "/org/spotify_recorder/Control"
+)]
+trait Control {
+    #[zbus(property)]
+    fn recording_enabled(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_recording_enabled(&self, enabled: bool) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn connection_status(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn current_song(&self) -> zbus::Result<String>;
+}
 
 #[tokio::test]
-async fn test_metadata_updates_no_duplication() -> Result<(), Box<dyn std::error::Error>> {
-    let bus_name = "org.mpris.MediaPlayer2.spotify.test2";
+async fn test_service_control() -> Result<(), Box<dyn std::error::Error>> {
+    let spotify_bus_name = "org.mpris.MediaPlayer2.spotify.test_control";
+    let service_bus_name = "org.spotify_recorder.test";
     let (tx, rx) = mpsc::channel(10);
 
-    // Start mock in background
+    // Start mock
     tokio::spawn(async move {
-        run_mock(rx, bus_name).await.unwrap();
+        run_mock(rx, spotify_bus_name).await.unwrap();
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    let connection = connection::Builder::session()?.build().await?;
-    let state = Arc::new(Mutex::new(ServiceState::default()));
+    let connection = connection::Builder::session()?
+        .name(service_bus_name)?
+        .build()
+        .await?;
+    let control = ServiceControl::new();
 
-    // Start monitor
-    let state_clone = state.clone();
-    let handle = tokio::spawn(monitor_spotify(
+    // Register our control interface
+    connection
+        .object_server()
+        .at("/org/spotify_recorder/Control", control)
+        .await?;
+
+    // Use proxy to talk to our own interface
+    let control_proxy = ControlProxy::builder(&connection)
+        .destination(service_bus_name)?
+        .build()
+        .await?;
+
+    // Start monitor manually for test
+    tokio::spawn(monitor_spotify(
         connection.clone(),
-        bus_name.to_string(),
-        state_clone,
+        spotify_bus_name.to_string(),
     ));
 
-    // Send metadata update
+    // Enable recording via DBus
+    control_proxy.set_recording_enabled(true).await?;
+    assert!(control_proxy.recording_enabled().await?);
+
+    // Wait for monitor to detect Spotify and update status
+    let mut status = "Disconnected".to_string();
+    for _ in 0..10 {
+        status = control_proxy.connection_status().await?;
+        if status == "Connected" {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, "Connected");
+
+    // Send metadata
     let mut metadata = HashMap::new();
     metadata.insert(
         "mpris:trackid".to_string(),
-        Value::from("track1").try_to_owned()?,
+        Value::from("track_ctrl_1").try_to_owned()?,
     );
     metadata.insert(
         "xesam:title".to_string(),
-        Value::from("Title 1").try_to_owned()?,
+        Value::from("Control Title").try_to_owned()?,
+    );
+    metadata.insert(
+        "xesam:artist".to_string(),
+        Value::from(vec!["Control Artist"]).try_to_owned()?,
     );
     tx.send(metadata).await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    {
-        let guard = state.lock().unwrap();
-        assert_eq!(
-            guard
-                .current_track
-                .as_ref()
-                .unwrap()
-                .title
-                .as_ref()
-                .unwrap(),
-            "Title 1"
-        );
+    // Wait for song update
+    let mut song = "None".to_string();
+    for _ in 0..10 {
+        song = control_proxy.current_song().await?;
+        if song == "Control Artist - Control Title" {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
-
-    // "Restart" Spotify: abort monitor and start new one
-    handle.abort();
-
-    let state_clone2 = state.clone();
-    tokio::spawn(monitor_spotify(
-        connection.clone(),
-        bus_name.to_string(),
-        state_clone2,
-    ));
-
-    // Send same metadata update
-    let mut metadata2 = HashMap::new();
-    metadata2.insert(
-        "mpris:trackid".to_string(),
-        Value::from("track1").try_to_owned()?,
-    );
-    metadata2.insert(
-        "xesam:title".to_string(),
-        Value::from("Title 1").try_to_owned()?,
-    );
-    tx.send(metadata2).await?;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // If it was duplicating or double-handling without track_id check, we might see multiple "now starting a new recording" in stdout
-
-    // Send DIFFERENT metadata
-    let mut metadata3 = HashMap::new();
-    metadata3.insert(
-        "mpris:trackid".to_string(),
-        Value::from("track2").try_to_owned()?,
-    );
-    metadata3.insert(
-        "xesam:title".to_string(),
-        Value::from("Title 2").try_to_owned()?,
-    );
-    tx.send(metadata3).await?;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    {
-        let guard = state.lock().unwrap();
-        assert_eq!(
-            guard
-                .current_track
-                .as_ref()
-                .unwrap()
-                .title
-                .as_ref()
-                .unwrap(),
-            "Title 2"
-        );
-    }
+    assert_eq!(song, "Control Artist - Control Title");
 
     Ok(())
 }

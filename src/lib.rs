@@ -3,10 +3,9 @@ pub mod mpris;
 use crate::mpris::PlayerProxy;
 use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use zbus::{fdo::DBusProxy, names::BusName, zvariant::OwnedValue};
+use zbus::{fdo::DBusProxy, interface, names::BusName, zvariant::OwnedValue};
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackInfo {
@@ -18,16 +17,86 @@ pub struct TrackInfo {
     pub track_number: Option<i32>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ServiceState {
+#[derive(
+    Debug, Clone, Copy, PartialEq, zbus::zvariant::Type, serde::Serialize, serde::Deserialize,
+)]
+#[repr(u8)]
+pub enum ConnectionStatus {
+    Disconnected = 0,
+    Connected = 1,
+}
+
+impl TryFrom<OwnedValue> for ConnectionStatus {
+    type Error = zbus::zvariant::Error;
+    fn try_from(v: OwnedValue) -> Result<Self, Self::Error> {
+        let s: &str = v.downcast_ref()?;
+        match s {
+            "Connected" => Ok(ConnectionStatus::Connected),
+            _ => Ok(ConnectionStatus::Disconnected),
+        }
+    }
+}
+
+impl From<ConnectionStatus> for zbus::zvariant::Value<'_> {
+    fn from(status: ConnectionStatus) -> Self {
+        match status {
+            ConnectionStatus::Disconnected => "Disconnected".into(),
+            ConnectionStatus::Connected => "Connected".into(),
+        }
+    }
+}
+
+pub struct ServiceControl {
+    pub recording_enabled: bool,
+    pub connection_status: ConnectionStatus,
     pub current_track: Option<TrackInfo>,
 }
 
-impl ServiceState {
+impl ServiceControl {
     pub fn new() -> Self {
         Self {
+            recording_enabled: false,
+            connection_status: ConnectionStatus::Disconnected,
             current_track: None,
         }
+    }
+}
+
+#[interface(name = "org.spotify_recorder.Control")]
+impl ServiceControl {
+    #[zbus(property)]
+    fn recording_enabled(&self) -> bool {
+        self.recording_enabled
+    }
+
+    #[zbus(property)]
+    fn set_recording_enabled(&mut self, enabled: bool) {
+        if self.recording_enabled != enabled {
+            self.recording_enabled = enabled;
+            info!(
+                "Recording mode: {}",
+                if enabled { "Enabled" } else { "Disabled" }
+            );
+        }
+    }
+
+    #[zbus(property)]
+    fn connection_status(&self) -> ConnectionStatus {
+        self.connection_status
+    }
+
+    #[zbus(property)]
+    fn current_song(&self) -> String {
+        self.current_track
+            .as_ref()
+            .map(|t| {
+                format!(
+                    "{} - {}",
+                    t.artist.as_deref().unwrap_or("Unknown Artist"),
+                    t.title.as_deref().unwrap_or("Unknown Title")
+                )
+            })
+            .unwrap_or_else(|| "None".to_string())
     }
 }
 
@@ -35,9 +104,15 @@ pub async fn run_service(
     connection: zbus::Connection,
     spotify_bus_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let control = ServiceControl::new();
+
+    connection
+        .object_server()
+        .at("/org/spotify_recorder/Control", control)
+        .await?;
+
     let dbus_proxy = DBusProxy::new(&connection).await?;
     let mut name_owner_changed = dbus_proxy.receive_name_owner_changed().await?;
-    let state = Arc::new(Mutex::new(ServiceState::new()));
 
     let mut monitor_handle: Option<JoinHandle<()>> = None;
 
@@ -45,11 +120,10 @@ pub async fn run_service(
     let spotify_bus_name_owned = BusName::try_from(spotify_bus_name)?;
     if let Ok(owner) = dbus_proxy.get_name_owner(spotify_bus_name_owned).await {
         info!("Spotify found: {}", owner);
-        let state_clone = state.clone();
+        update_connection_status(&connection, ConnectionStatus::Connected).await;
         monitor_handle = Some(tokio::spawn(monitor_spotify(
             connection.clone(),
             spotify_bus_name.to_string(),
-            state_clone,
         )));
     }
 
@@ -58,21 +132,20 @@ pub async fn run_service(
         if args.name() == spotify_bus_name {
             if let Some(_new_owner) = args.new_owner().as_ref() {
                 info!("Spotify appeared");
-                // Cancel previous monitor if any (though it should have errored out)
                 if let Some(handle) = monitor_handle.take() {
                     handle.abort();
                 }
-                let state_clone = state.clone();
+                update_connection_status(&connection, ConnectionStatus::Connected).await;
                 monitor_handle = Some(tokio::spawn(monitor_spotify(
                     connection.clone(),
                     spotify_bus_name.to_string(),
-                    state_clone,
                 )));
             } else {
                 warn!("Spotify disappeared");
                 if let Some(handle) = monitor_handle.take() {
                     handle.abort();
                 }
+                update_connection_status(&connection, ConnectionStatus::Disconnected).await;
             }
         }
     }
@@ -80,11 +153,32 @@ pub async fn run_service(
     Ok(())
 }
 
-pub async fn monitor_spotify(
-    connection: zbus::Connection,
-    bus_name: String,
-    state: Arc<Mutex<ServiceState>>,
-) {
+async fn update_connection_status(connection: &zbus::Connection, status: ConnectionStatus) {
+    if let Ok(iface_ref) = connection
+        .object_server()
+        .interface::<_, ServiceControl>("/org/spotify_recorder/Control")
+        .await
+    {
+        let mut iface = iface_ref.get_mut().await;
+        if iface.connection_status != status {
+            iface.connection_status = status;
+            if status == ConnectionStatus::Disconnected {
+                iface.current_track = None;
+                iface
+                    .current_song_changed(iface_ref.signal_emitter())
+                    .await
+                    .unwrap_or_default();
+            }
+            iface
+                .connection_status_changed(iface_ref.signal_emitter())
+                .await
+                .unwrap_or_default();
+        }
+    }
+}
+
+pub async fn monitor_spotify(connection: zbus::Connection, bus_name: String) {
+    update_connection_status(&connection, ConnectionStatus::Connected).await;
     let player_proxy = match PlayerProxy::builder(&connection)
         .destination(bus_name)
         .unwrap()
@@ -106,17 +200,20 @@ pub async fn monitor_spotify(
 
     // Initial metadata
     if let Ok(metadata) = player_proxy.metadata().await {
-        handle_metadata_update(metadata, &state);
+        handle_metadata_update(metadata, &connection).await;
     }
 
     while let Some(_) = metadata_stream.next().await {
         if let Ok(metadata) = player_proxy.metadata().await {
-            handle_metadata_update(metadata, &state);
+            handle_metadata_update(metadata, &connection).await;
         }
     }
 }
 
-fn handle_metadata_update(metadata: HashMap<String, OwnedValue>, state: &Arc<Mutex<ServiceState>>) {
+async fn handle_metadata_update(
+    metadata: HashMap<String, OwnedValue>,
+    connection: &zbus::Connection,
+) {
     let mut track = TrackInfo::default();
 
     if let Some(v) = metadata.get("mpris:trackid") {
@@ -155,21 +252,38 @@ fn handle_metadata_update(metadata: HashMap<String, OwnedValue>, state: &Arc<Mut
         })
     });
 
-    let mut state_guard = state.lock().unwrap();
+    if let Ok(iface_ref) = connection
+        .object_server()
+        .interface::<_, ServiceControl>("/org/spotify_recorder/Control")
+        .await
+    {
+        let mut guard = iface_ref.get_mut().await;
 
-    // Check if it's the same track (Spotify sometimes sends multiple metadata updates for same track)
-    if let Some(current) = &state_guard.current_track {
-        if current.track_id == track.track_id {
-            return;
+        // Check if it's the same track
+        if let Some(current) = &guard.current_track {
+            if current.track_id == track.track_id {
+                return;
+            }
+
+            if guard.recording_enabled {
+                // Export previous
+                let artist = current.artist.as_deref().unwrap_or("Unknown Artist");
+                let title = current.title.as_deref().unwrap_or("Unknown Title");
+                println!("exporting file: /tmp/recordings/{}/{}.wav", artist, title);
+            }
         }
 
-        // Export previous
-        let artist = current.artist.as_deref().unwrap_or("Unknown Artist");
-        let title = current.title.as_deref().unwrap_or("Unknown Title");
-        println!("exporting file: /tmp/recordings/{}/{}.wav", artist, title);
-    }
+        info!("New track detected: {:?} - {:?}", track.artist, track.title);
+        guard.current_track = Some(track);
 
-    info!("New track detected: {:?} - {:?}", track.artist, track.title);
-    state_guard.current_track = Some(track);
-    println!("now starting a new recording");
+        if guard.recording_enabled {
+            println!("now starting a new recording");
+        }
+
+        // Emit PropertyChanged for CurrentSong
+        guard
+            .current_song_changed(iface_ref.signal_emitter())
+            .await
+            .unwrap_or_default();
+    }
 }
