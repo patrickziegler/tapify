@@ -234,6 +234,9 @@ pw-loopback \
 
 - **Robustness**: Handle arbitrary startup order (service vs. Spotify) and Spotify restarts mid-session.
 - **Concurrency**: Use `tokio` for async event handling and task orchestration.
+- **Recording Logic**: 
+    - When recording mode is enabled, the service must wait for the *next* metadata update (track change) before starting to capture audio. This ensures only full tracks are recorded.
+    - When recording mode is disabled, any active recording must stop immediately and be discarded (not exported).
 - **Audio Routing**: Use PipeWire CLI tools (`pactl`, `wpctl`, `pw-loopback`, `pw-dump`) to manage virtual sinks and routing. Avoid unmaintained PipeWire crates.
 - **Background Export**: Exporting (tagging, moving files) must happen in a dedicated background thread/task to avoid blocking the recorder.
 - **Metadata**: Add ID3 tags (including album art via `mpris:artUrl`) to exported files.

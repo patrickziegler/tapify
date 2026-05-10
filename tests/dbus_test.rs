@@ -52,10 +52,13 @@ async fn test_service_control() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
+    let (session_tx, _session_rx) = mpsc::channel(10);
+
     // Start monitor manually for test
     tokio::spawn(monitor_spotify(
         connection.clone(),
         spotify_bus_name.to_string(),
+        session_tx,
     ));
 
     // Enable recording via DBus
@@ -87,7 +90,7 @@ async fn test_service_control() -> Result<(), Box<dyn std::error::Error>> {
         "xesam:artist".to_string(),
         Value::from(vec!["Control Artist"]).try_to_owned()?,
     );
-    tx.send(metadata).await?;
+    tx.send(mock::MockCommand::Metadata(metadata)).await?;
 
     // Wait for song update
     let mut song = "None".to_string();

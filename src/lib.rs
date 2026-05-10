@@ -2,7 +2,11 @@ pub mod mpris;
 
 use crate::mpris::PlayerProxy;
 use futures_util::StreamExt;
+use id3::TagLike;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use zbus::{fdo::DBusProxy, interface, names::BusName, zvariant::OwnedValue};
@@ -15,6 +19,12 @@ pub struct TrackInfo {
     pub artist: Option<String>,
     pub art_url: Option<String>,
     pub track_number: Option<i32>,
+}
+
+pub struct RecordingSession {
+    pub child: Child,
+    pub temp_path: PathBuf,
+    pub track: TrackInfo,
 }
 
 #[derive(
@@ -37,19 +47,117 @@ impl TryFrom<OwnedValue> for ConnectionStatus {
     }
 }
 
-impl From<ConnectionStatus> for zbus::zvariant::Value<'_> {
-    fn from(status: ConnectionStatus) -> Self {
-        match status {
-            ConnectionStatus::Disconnected => "Disconnected".into(),
-            ConnectionStatus::Connected => "Connected".into(),
+pub async fn exporter_task(mut rx: mpsc::Receiver<RecordingSession>) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let music_dir = PathBuf::from(home).join("Music").join("Spotify");
+
+    while let Some(mut session) = rx.recv().await {
+        let track = session.track;
+        let temp_path = session.temp_path;
+
+        info!("Exporting track: {} - {}", 
+            track.artist.as_deref().unwrap_or("Unknown Artist"),
+            track.title.as_deref().unwrap_or("Unknown Title")
+        );
+
+        // 1. Wait for pw-record to finish and close the file
+        match session.child.wait().await {
+            Ok(status) => {
+                if !status.success() {
+                    warn!("pw-record exited with error: {}", status);
+                }
+            }
+            Err(e) => {
+                error!("Failed to wait for pw-record: {}", e);
+            }
+        }
+
+        // 2. Small delay to ensure FS synchronization
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        if !temp_path.exists() {
+            error!("Recording file {:?} does not exist after process exit", temp_path);
+            continue;
+        }
+
+        let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
+        let album = track.album.as_deref().unwrap_or("Unknown Album");
+        let title = track.title.as_deref().unwrap_or("Unknown Title");
+        let track_number = track.track_number.unwrap_or(0);
+
+        let dest_dir = music_dir.join(artist).join(album);
+        if let Err(e) = tokio::fs::create_dir_all(&dest_dir).await {
+            error!("Failed to create directory {:?}: {}", dest_dir, e);
+            continue;
+        }
+
+        let file_name = format!("{:02} - {}.wav", track_number, title);
+        let dest_path = dest_dir.join(file_name);
+
+        // Apply ID3 tags
+        let track_for_tags = track.clone();
+        let temp_path_for_tags = temp_path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            apply_tags(&temp_path_for_tags, &track_for_tags)
+        }).await.unwrap() {
+            warn!("Failed to apply tags to {:?}: {}", temp_path, e);
+        }
+
+        if let Err(e) = move_file(&temp_path, &dest_path).await {
+            error!("Failed to move file to {:?}: {}", dest_path, e);
+        } else {
+            info!("Track exported to {:?}", dest_path);
         }
     }
+}
+
+async fn move_file(source: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    if let Err(e) = tokio::fs::rename(source, dest).await {
+        if e.raw_os_error() == Some(18) {
+            // Invalid cross-device link, fallback to copy and delete
+            tokio::fs::copy(source, dest).await?;
+            tokio::fs::remove_file(source).await?;
+            Ok(())
+        } else {
+            Err(e)
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_tags(path: &std::path::Path, track: &TrackInfo) -> anyhow::Result<()> {
+    let mut tag = id3::Tag::new();
+    tag.set_title(track.title.as_deref().unwrap_or("Unknown Title"));
+    tag.set_artist(track.artist.as_deref().unwrap_or("Unknown Artist"));
+    tag.set_album(track.album.as_deref().unwrap_or("Unknown Album"));
+    if let Some(n) = track.track_number {
+        tag.set_track(n as u32);
+    }
+
+    // Download album art
+    if let Some(art_url) = &track.art_url {
+        if let Ok(response) = reqwest::blocking::get(art_url) {
+            if let Ok(bytes) = response.bytes() {
+                tag.add_frame(id3::frame::Picture {
+                    mime_type: "image/jpeg".to_string(), // Spotify art is usually jpeg
+                    picture_type: id3::frame::PictureType::CoverFront,
+                    description: "Album Art".to_string(),
+                    data: bytes.to_vec(),
+                });
+            }
+        }
+    }
+
+    tag.write_to_path(path, id3::Version::Id3v24)?;
+    Ok(())
 }
 
 pub struct ServiceControl {
     pub recording_enabled: bool,
     pub connection_status: ConnectionStatus,
     pub current_track: Option<TrackInfo>,
+    pub waiting_for_next_track: bool,
 }
 
 impl ServiceControl {
@@ -58,6 +166,7 @@ impl ServiceControl {
             recording_enabled: false,
             connection_status: ConnectionStatus::Disconnected,
             current_track: None,
+            waiting_for_next_track: false,
         }
     }
 }
@@ -70,19 +179,28 @@ impl ServiceControl {
     }
 
     #[zbus(property)]
-    fn set_recording_enabled(&mut self, enabled: bool) {
+    pub async fn set_recording_enabled(&mut self, #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>, enabled: bool) {
         if self.recording_enabled != enabled {
             self.recording_enabled = enabled;
             info!(
                 "Recording mode: {}",
                 if enabled { "Enabled" } else { "Disabled" }
             );
+            if enabled {
+                self.waiting_for_next_track = true;
+            } else {
+                self.waiting_for_next_track = false;
+            }
+            self.recording_enabled_changed(&emitter).await.unwrap_or_default();
         }
     }
 
     #[zbus(property)]
-    fn connection_status(&self) -> ConnectionStatus {
-        self.connection_status
+    fn connection_status(&self) -> String {
+        match self.connection_status {
+            ConnectionStatus::Connected => "Connected".to_string(),
+            ConnectionStatus::Disconnected => "Disconnected".to_string(),
+        }
     }
 
     #[zbus(property)]
@@ -104,12 +222,8 @@ pub async fn run_service(
     connection: zbus::Connection,
     spotify_bus_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let control = ServiceControl::new();
-
-    connection
-        .object_server()
-        .at("/org/spotify_recorder/Control", control)
-        .await?;
+    let (tx, rx) = mpsc::channel(10);
+    tokio::spawn(exporter_task(rx));
 
     let dbus_proxy = DBusProxy::new(&connection).await?;
     let mut name_owner_changed = dbus_proxy.receive_name_owner_changed().await?;
@@ -124,6 +238,7 @@ pub async fn run_service(
         monitor_handle = Some(tokio::spawn(monitor_spotify(
             connection.clone(),
             spotify_bus_name.to_string(),
+            tx.clone(),
         )));
     }
 
@@ -139,6 +254,7 @@ pub async fn run_service(
                 monitor_handle = Some(tokio::spawn(monitor_spotify(
                     connection.clone(),
                     spotify_bus_name.to_string(),
+                    tx.clone(),
                 )));
             } else {
                 warn!("Spotify disappeared");
@@ -177,7 +293,11 @@ async fn update_connection_status(connection: &zbus::Connection, status: Connect
     }
 }
 
-pub async fn monitor_spotify(connection: zbus::Connection, bus_name: String) {
+pub async fn monitor_spotify(
+    connection: zbus::Connection,
+    bus_name: String,
+    tx: mpsc::Sender<RecordingSession>,
+) {
     update_connection_status(&connection, ConnectionStatus::Connected).await;
     let player_proxy = match PlayerProxy::builder(&connection)
         .destination(bus_name)
@@ -193,26 +313,197 @@ pub async fn monitor_spotify(connection: zbus::Connection, bus_name: String) {
     };
 
     let mut metadata_stream = player_proxy.receive_metadata_changed().await;
+    let mut playback_stream = player_proxy.receive_playback_status_changed().await;
 
     let destination = player_proxy.inner().destination();
     let dest_str = destination.as_str();
-    info!("Monitoring metadata updates for {}...", dest_str);
+    info!("Monitoring updates for {}...", dest_str);
 
-    // Initial metadata
+    let mut session: Option<RecordingSession> = None;
+    let mut current_status = player_proxy.playback_status().await.unwrap_or_else(|_| "Unknown".to_string());
+
+    // Initial state
     if let Ok(metadata) = player_proxy.metadata().await {
-        handle_metadata_update(metadata, &connection).await;
+        handle_metadata_update(metadata, &connection, &tx, &mut session, &current_status).await;
     }
 
-    while let Some(_) = metadata_stream.next().await {
-        if let Ok(metadata) = player_proxy.metadata().await {
-            handle_metadata_update(metadata, &connection).await;
+    loop {
+        tokio::select! {
+            Some(_) = metadata_stream.next() => {
+                if let Ok(metadata) = player_proxy.metadata().await {
+                    handle_metadata_update(metadata, &connection, &tx, &mut session, &current_status).await;
+                }
+            }
+            Some(_) = playback_stream.next() => {
+                if let Ok(status) = player_proxy.playback_status().await {
+                    current_status = status.clone();
+                    handle_playback_status_update(status, &connection, &tx, &mut session).await;
+                }
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                // Periodic check for recording_enabled changes to handle immediate stop/discard
+                if let Ok(iface_ref) = connection
+                    .object_server()
+                    .interface::<_, ServiceControl>("/org/spotify_recorder/Control")
+                    .await
+                {
+                    let guard = iface_ref.get().await;
+                    if !guard.recording_enabled && session.is_some() {
+                        drop(guard);
+                        discard_recording(&mut session).await;
+                    }
+                }
+            }
+            else => break,
         }
+    }
+
+    // Cleanup session if monitor stops
+    if let Some(s) = session.take() {
+        let _ = tx.send(s).await;
+    }
+}
+
+async fn handle_playback_status_update(
+    status: String,
+    connection: &zbus::Connection,
+    tx: &mpsc::Sender<RecordingSession>,
+    session: &mut Option<RecordingSession>,
+) {
+    info!("Playback status changed: {}", status);
+
+    if let Ok(iface_ref) = connection
+        .object_server()
+        .interface::<_, ServiceControl>("/org/spotify_recorder/Control")
+        .await
+    {
+        let guard = iface_ref.get().await;
+        let recording_enabled = guard.recording_enabled;
+        drop(guard);
+
+        if !recording_enabled && session.is_some() {
+            discard_recording(session).await;
+            return;
+        }
+
+        if status == "Playing" {
+            start_recording_if_needed(connection, session, &status).await;
+        } else {
+            stop_recording(tx, session).await;
+        }
+    }
+}
+
+async fn get_default_sink_monitor() -> Option<String> {
+    // 1. Get default sink name
+    let output = Command::new("pactl").arg("get-default-sink").output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let default_sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let monitor_name = format!("{}.monitor", default_sink);
+
+    // 2. Get sources list and find the monitor
+    let output = Command::new("pactl").arg("list").arg("short").arg("sources").output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sources = String::from_utf8_lossy(&output.stdout);
+    for line in sources.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[1] == monitor_name {
+            return Some(parts[0].to_string());
+        }
+    }
+
+    None
+}
+
+async fn start_recording_if_needed(
+    connection: &zbus::Connection,
+    session: &mut Option<RecordingSession>,
+    playback_status: &str,
+) {
+    if session.is_some() || playback_status != "Playing" {
+        return;
+    }
+
+    if let Ok(iface_ref) = connection
+        .object_server()
+        .interface::<_, ServiceControl>("/org/spotify_recorder/Control")
+        .await
+    {
+        let guard = iface_ref.get().await;
+        if guard.recording_enabled && !guard.waiting_for_next_track {
+            if let Some(track) = &guard.current_track {
+                let target_node = get_default_sink_monitor().await;
+                
+                let temp_file = match tempfile::NamedTempFile::new() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to create temp file: {}", e);
+                        return;
+                    }
+                };
+                let temp_path = match temp_file.into_temp_path().keep() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Failed to persist temp file: {}", e);
+                        return;
+                    }
+                };
+
+                info!("Starting recording to {:?}", temp_path);
+                let mut cmd = Command::new("pw-record");
+                if let Some(node) = target_node {
+                    info!("Recording from node: {}", node);
+                    cmd.arg("--target").arg(node);
+                } else {
+                    warn!("Could not detect default sink monitor, falling back to default input");
+                }
+                
+                match cmd.arg(&temp_path).spawn() {
+                    Ok(child) => {
+                        *session = Some(RecordingSession {
+                            child,
+                            temp_path,
+                            track: track.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to start pw-record: {}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn discard_recording(session: &mut Option<RecordingSession>) {
+    if let Some(mut s) = session.take() {
+        info!("Discarding active recording for {}", s.track.title.as_deref().unwrap_or("Unknown"));
+        let _ = s.child.kill().await;
+        let _ = tokio::fs::remove_file(&s.temp_path).await;
+    }
+}
+
+async fn stop_recording(
+    tx: &mpsc::Sender<RecordingSession>,
+    session: &mut Option<RecordingSession>,
+) {
+    if let Some(mut s) = session.take() {
+        info!("Stopping recording for {}", s.track.title.as_deref().unwrap_or("Unknown"));
+        let _ = s.child.kill().await;
+        let _ = tx.send(s).await;
     }
 }
 
 async fn handle_metadata_update(
     metadata: HashMap<String, OwnedValue>,
     connection: &zbus::Connection,
+    tx: &mpsc::Sender<RecordingSession>,
+    session: &mut Option<RecordingSession>,
+    playback_status: &str,
 ) {
     let mut track = TrackInfo::default();
 
@@ -258,6 +549,7 @@ async fn handle_metadata_update(
         .await
     {
         let mut guard = iface_ref.get_mut().await;
+        let recording_enabled = guard.recording_enabled;
 
         // Check if it's the same track
         if let Some(current) = &guard.current_track {
@@ -265,19 +557,22 @@ async fn handle_metadata_update(
                 return;
             }
 
-            if guard.recording_enabled {
-                // Export previous
-                let artist = current.artist.as_deref().unwrap_or("Unknown Artist");
-                let title = current.title.as_deref().unwrap_or("Unknown Title");
-                println!("exporting file: /tmp/recordings/{}/{}.wav", artist, title);
+            // Track changed, handle previous session
+            if session.is_some() {
+                if !recording_enabled {
+                    discard_recording(session).await;
+                } else {
+                    stop_recording(tx, session).await;
+                }
             }
         }
 
         info!("New track detected: {:?} - {:?}", track.artist, track.title);
         guard.current_track = Some(track);
 
-        if guard.recording_enabled {
-            println!("now starting a new recording");
+        if recording_enabled && guard.waiting_for_next_track {
+            info!("First track after enabling recording mode detected, starting with next track.");
+            guard.waiting_for_next_track = false;
         }
 
         // Emit PropertyChanged for CurrentSong
@@ -285,5 +580,9 @@ async fn handle_metadata_update(
             .current_song_changed(iface_ref.signal_emitter())
             .await
             .unwrap_or_default();
+
+        // Drop guard before calling start_recording_if_needed to avoid deadlock
+        drop(guard);
+        start_recording_if_needed(connection, session, playback_status).await;
     }
 }
