@@ -17,8 +17,10 @@ pub struct TrackInfo {
     pub title: Option<String>,
     pub album: Option<String>,
     pub artist: Option<String>,
+    pub album_artist: Option<String>,
     pub art_url: Option<String>,
     pub track_number: Option<i32>,
+    pub disc_number: Option<i32>,
 }
 
 pub struct RecordingSession {
@@ -131,8 +133,14 @@ fn apply_tags(path: &std::path::Path, track: &TrackInfo) -> anyhow::Result<()> {
     tag.set_title(track.title.as_deref().unwrap_or("Unknown Title"));
     tag.set_artist(track.artist.as_deref().unwrap_or("Unknown Artist"));
     tag.set_album(track.album.as_deref().unwrap_or("Unknown Album"));
+    if let Some(artist) = &track.album_artist {
+        tag.set_album_artist(artist);
+    }
     if let Some(n) = track.track_number {
         tag.set_track(n as u32);
+    }
+    if let Some(n) = track.disc_number {
+        tag.set_disc(n as u32);
     }
 
     // Download album art
@@ -498,13 +506,7 @@ async fn stop_recording(
     }
 }
 
-async fn handle_metadata_update(
-    metadata: HashMap<String, OwnedValue>,
-    connection: &zbus::Connection,
-    tx: &mpsc::Sender<RecordingSession>,
-    session: &mut Option<RecordingSession>,
-    playback_status: &str,
-) {
+fn parse_track_info(metadata: &HashMap<String, OwnedValue>) -> TrackInfo {
     let mut track = TrackInfo::default();
 
     if let Some(v) = metadata.get("mpris:trackid") {
@@ -529,6 +531,10 @@ async fn handle_metadata_update(
         .get("xesam:trackNumber")
         .and_then(|v| v.downcast_ref::<i32>().ok());
 
+    track.disc_number = metadata
+        .get("xesam:discNumber")
+        .and_then(|v| v.downcast_ref::<i32>().ok());
+
     track.artist = metadata.get("xesam:artist").and_then(|v| {
         let a: Result<&zbus::zvariant::Array, _> = v.downcast_ref();
         a.ok().map(|array| {
@@ -542,6 +548,32 @@ async fn handle_metadata_update(
                 .join(", ")
         })
     });
+
+    track.album_artist = metadata.get("xesam:albumArtist").and_then(|v| {
+        let a: Result<&zbus::zvariant::Array, _> = v.downcast_ref();
+        a.ok().map(|array| {
+            array
+                .iter()
+                .filter_map(|val| {
+                    let s: Result<&str, _> = val.try_into();
+                    s.ok().map(|s| s.to_string())
+                })
+                .collect::<Vec<String>>()
+                .join(", ")
+        })
+    });
+
+    track
+}
+
+async fn handle_metadata_update(
+    metadata: HashMap<String, OwnedValue>,
+    connection: &zbus::Connection,
+    tx: &mpsc::Sender<RecordingSession>,
+    session: &mut Option<RecordingSession>,
+    playback_status: &str,
+) {
+    let track = parse_track_info(&metadata);
 
     if let Ok(iface_ref) = connection
         .object_server()
@@ -584,5 +616,59 @@ async fn handle_metadata_update(
         // Drop guard before calling start_recording_if_needed to avoid deadlock
         drop(guard);
         start_recording_if_needed(connection, session, playback_status).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zbus::zvariant::Value;
+
+    #[test]
+    fn test_parse_track_info() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "mpris:trackid".to_string(),
+            Value::from("track1").try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "xesam:title".to_string(),
+            Value::from("Title").try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "xesam:album".to_string(),
+            Value::from("Album").try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "xesam:artist".to_string(),
+            Value::from(vec!["Artist 1", "Artist 2"]).try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "xesam:albumArtist".to_string(),
+            Value::from(vec!["Album Artist 1"]).try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "xesam:trackNumber".to_string(),
+            Value::from(5i32).try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "xesam:discNumber".to_string(),
+            Value::from(1i32).try_to_owned().unwrap(),
+        );
+        metadata.insert(
+            "mpris:artUrl".to_string(),
+            Value::from("https://example.com/art.jpg").try_to_owned().unwrap(),
+        );
+
+        let track = parse_track_info(&metadata);
+
+        assert_eq!(track.track_id, "track1");
+        assert_eq!(track.title, Some("Title".to_string()));
+        assert_eq!(track.album, Some("Album".to_string()));
+        assert_eq!(track.artist, Some("Artist 1, Artist 2".to_string()));
+        assert_eq!(track.album_artist, Some("Album Artist 1".to_string()));
+        assert_eq!(track.track_number, Some(5));
+        assert_eq!(track.disc_number, Some(1));
+        assert_eq!(track.art_url, Some("https://example.com/art.jpg".to_string()));
     }
 }
