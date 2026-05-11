@@ -221,6 +221,19 @@ pw-loopback \
         --playback-props="node.target=@DEFAULT_AUDIO_SINK@"
 ```
 
+Finding the default audio sink
+
+```sh
+pactl list short sources | awk '/\.monitor/ {print $1, $2}' | grep "$(pactl get-default-sink).monitor" | awk '{print $1}'
+
+```
+
+Recording can be done with
+
+```sh
+pw-cat --record --target 50 --format s16 --rate 48000 --channels 2 - | ffmpeg -f s16le -ar 48000 -ac 2 -i pipe:0 output.mp3
+```
+
 ## Observed system behavior
 
 - When Spotify starts up, its interface becomes available on DBus immediately
