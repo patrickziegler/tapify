@@ -1,7 +1,7 @@
 services:
   dev:
-    image: spotify-recorder-dev
-    container_name: spotify-recorder-dev
+    image: taped-dev
+    container_name: taped-dev
     stdin_open: true
     tty: true
     environment:

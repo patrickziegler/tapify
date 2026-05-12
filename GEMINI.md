@@ -1,6 +1,6 @@
 # Project Overview
 
-`spotify-recorder` is a system service for Linux that allows to record and export tracks played on Spotify.
+`taped` is a system service for Linux that allows to record and export tracks played on Spotify.
 In order to know when a new track begins, the service monitors metadata updates coming from Spotify via DBus.
 The provided metadata (incl. album covers) is added to the exported files in the form of ID3 tags.
 The files are exported to a given destination directory with a subfolder tree for artist / album.

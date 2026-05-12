@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use zbus::connection;
 
-pub use spotify_recorder::watchdog::run_service;
+pub use taped::watchdog::run_service;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
