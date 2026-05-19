@@ -13,9 +13,11 @@ RUN apt-get update && apt-get install -y \
     pipewire-bin \
     && rm -rf /var/lib/apt/lists/*
 
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
  && apt-get install -y nodejs \
  && npm install -g @google/gemini-cli \
- && node -v && npm -v && rustc --version
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
